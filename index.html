@@ -1,21 +1,12 @@
 <!DOCTYPE html>
 <!-- 
-  V8.2.0 (Axiom Refactor V2.0.5)
-  - [AXIOM V2.0.5] 修复: 移除了 "INTERNAL_IPC_PORT" 的配置 UI，
-    因为 IPC (WS) 现在与 Panel (HTTP) 共享同一个端口。
-  - [AXIOM V2.0.4] 修复: 重新添加了缺失的 "载荷生成器" (Payload Generator) 
-    HTML 视图 (id="view-payload-gen")。
-  - [AXIOM V2.0.4] 修复: 将 "修改管理员密码" 表单中的 id 修复为
-    "admin-new-password" 和 "admin-confirm-new-password"。
-  - [AXIOM V2.0.1] 新增: "端口配置" 视图 (id="view-port-config")。
-  - [AXIOM V2.0.0] 架构: 移除所有内联 <script>，
-    替换为 <script src="app.js" defer></script>。
-  - [AXIOM V2.0.0] 架构: 移除 FLASK_CONFIG 模板。
-  - [AXIOM V2.1.0] 新增: SNI 查找器 UI。
-  - [AXIOM V2.1.1] 修复: 载荷生成器视图的 3 列布局。
-  - [AXIOM V2.2.0] 修复: 在“新增用户”表单中添加实时令牌生成器 UI。
-  - [AXIOM V2.2.1] 布局: 优化侧边栏分组。
-  - [AXIOM V2.2.1] 布局: 将“新增用户”移至模态框，提升用户列表优先级。
+  V8.3.0 (Axiom Refactor V3.0 - Realtime Push)
+  - [AXIOM V3.0] 需求 #5 (UI): 新增 WebSocket 状态指示灯
+    - 在顶部导航栏添加了 `id="ws-status-button"` 和 `id="ws-status-icon"`。
+  - [AXIOM V3.0] 需求 #4 (静默更新):
+    - (注意: 为静默更新添加 `id` 属性的操作将在 `app.js`
+      的 `renderUserList` 和 `renderUserQuickStats`
+      函数中完成，而不是在此 HTML 骨架中。)
 -->
 <html lang="zh-CN" data-theme="light">
 <head>
@@ -96,6 +87,12 @@
         .speed-mobile .speed-up { color: #34d399; }
         .speed-mobile .speed-down { color: #fbbf24; }
         
+        /* [AXIOM V3.0] 状态灯的颜色 (Tailwind 颜色) */
+        .status-light-red { color: #f87171; /* red-400 */ }
+        .status-light-green { color: #4ade80; /* green-400 */ }
+        .status-light-blue { color: #60a5fa; /* blue-400 */ }
+        .status-light-gray { color: #9ca3af; /* gray-400 */ }
+        
     </style>
 </head>
 <body class="bg-base-200">
@@ -124,6 +121,14 @@
                     </h1>
                 </div>
                 <div class="flex-none gap-2">
+                
+                    <!-- [AXIOM V3.0] 需求 #5: WebSocket 状态指示灯 -->
+                    <div id="ws-status-tooltip" class="tooltip tooltip-bottom" data-tip="正在连接 WebSocket...">
+                        <button id="ws-status-button" class="btn btn-ghost btn-circle btn-sm pointer-events-none" aria-label="WebSocket 状态">
+                            <i id="ws-status-icon" data-lucide="wifi-off" class="w-5 h-5 status-light-gray transition-colors duration-300"></i>
+                        </button>
+                    </div>
+
                     <label class="swap swap-rotate btn btn-ghost btn-circle">
                         <input type="checkbox" id="theme-toggle" class="theme-controller" value="dark" />
                         <i data-lucide="sun" class="swap-on fill-current w-5 h-5"></i>
@@ -227,21 +232,17 @@
                         </div>
                     </div>
                     
-                    <!-- [AXIOM V2.2.1] 布局: 移除 "新增用户" 卡片，替换为按钮 -->
                     <section class="mb-6">
                         <button onclick="openModal('add-user-modal')" class="btn btn-primary shadow-md">
                             <i data-lucide="user-plus" class="w-4 h-4"></i> 新增用户
                         </button>
                     </section>
                     
-                    <!-- [AXIOM V2.2.1] 布局: 移除 "用户列表搜索" 卡片 -->
-                    
                     <!-- 用户列表 (DaisyUI) -->
                     <section class="card bg-base-100 shadow-xl">
                         <div class="card-body p-6">
                             <h3 class="card-title text-xl font-semibold text-base-content border-b border-base-300 pb-3">现有用户列表</h3>
                             
-                            <!-- [AXIOM V2.2.1] 布局: 在此处插入搜索框 -->
                             <div class="form-control mb-4">
                                 <label class="label hidden" for="user-search-input"><span class="label-text">搜索用户</span></label>
                                 <div class="input-group">
@@ -321,15 +322,12 @@
                     </section>
                 </div>
                 
-                <!-- [AXIOM V2.0.4] 修复: 重新添加 "载荷生成器" 视图 -->
                 <!-- 7. 载荷生成器 (Payload Generator) -->
                 <div id="view-payload-gen" class="hidden">
                     <h2 class="text-2xl font-bold text-base-content mb-6">🧬 载荷 (Payload) 生成器</h2>
                     
-                    <!-- [AXIOM V2.1.1] 修复: 布局。从 lg:grid-cols-2 改为 lg:grid-cols-3 -->
                     <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
                         
-                        <!-- [AXIOM V2.1.1] 修复: 这是第 1 列 -->
                         <!-- 模块 A: 载荷配置 (HTTP Injector) -->
                         <div class="card bg-base-100 shadow-xl">
                             <div class="card-body p-6">
@@ -338,7 +336,6 @@
                                     载荷配置 (HTTP Injector)
                                 </h3>
 
-                                <!-- [AXIOM V1.7] 新增: 拆分载荷 (Payload Eater) -->
                                 <div class="form-control p-4 bg-base-200 rounded-lg border border-base-300">
                                     <label class="label cursor-pointer justify-start gap-3">
                                         <input type="checkbox" id="payload-split-enable" class="toggle toggle-primary" checked>
@@ -363,7 +360,6 @@
                                         </div>
                                     </div>
                                 </div>
-                                <!-- 结束 V1.7 新增 -->
 
                                 <div class="divider text-sm">Request 2 (升级请求)</div>
                                 
@@ -421,7 +417,6 @@
                                             <input type="checkbox" id="payload-header-websocket" class="checkbox checkbox-sm" checked>
                                             <span class="label-text">Websocket</span>
                                         </label>
-                                        <!-- [AXIOM V1.7] 新增: X-Online-Host -->
                                         <label class="label cursor-pointer justify-start gap-3">
                                             <input type="checkbox" id="payload-header-online-host" class="checkbox checkbox-sm" checked>
                                             <span class="label-text">X-Online-Host</span>
@@ -431,8 +426,7 @@
                             </div>
                         </div>
 
-                        <!-- [AXIOM V2.1.1] 修复: 这是第 2 列 -->
-                        <!-- [AXIOM V2.1] 新增: SNI 查找器卡片 -->
+                        <!-- SNI 查找器卡片 -->
                         <div class="card bg-base-100 shadow-xl lg:col-span-1">
                             <div class="card-body p-6">
                                 <h3 class="card-title text-xl font-semibold text-base-content border-b border-base-300 pb-3">
@@ -461,7 +455,6 @@
                             </div>
                         </div>
                             
-                        <!-- [AXIOM V2.1.1] 修复: 这是第 3 列 -->
                         <!-- 模块 B & C: 认证与输出 -->
                         <div class="space-y-6"> 
                             
@@ -481,7 +474,6 @@
                                         </select>
                                     </div>
 
-                                    <!-- [AXIOM V1.6] 新增: 从列表选择用户 -->
                                     <div class="form-control">
                                         <label class="label" for="payload-user-select"><span class="label-text">从列表选择用户 (可选)</span></label>
                                         <select id="payload-user-select" class="select select-bordered w-full">
@@ -536,7 +528,6 @@
                         
                     </div>
                 </div>
-                <!-- [AXIOM V2.0.4] 结束: 载荷生成器视图 -->
 
 
                 <!-- 5. 系统配置/日志视图 -->
@@ -577,12 +568,10 @@
                                 </div>
                                 <div class="form-control">
                                     <label class="label" for="admin-new-password"><span class="label-text">新密码 (至少6位)</span></label>
-                                    <!-- [AXIOM V2.0.4] 修复: 更改 ID -->
                                     <input type="password" id="admin-new-password" required minlength="6" class="input input-bordered w-full">
                                 </div>
                                 <div class="form-control">
                                     <label class="label" for="admin-confirm-new-password"><span class="label-text">确认新密码</span></label>
-                                    <!-- [AXIOM V2.0.4] 修复: 更改 ID -->
                                     <input type="password" id="admin-confirm-new-password" required minlength="6" class="input input-bordered w-full">
                                 </div>
                                 <div class="card-actions mt-2">
@@ -648,7 +637,7 @@
                     </section>
                 </div>
                 
-                <!-- [AXIOM V2.0.1] 新增: 8. 端口配置视图 -->
+                <!-- 8. 端口配置视图 -->
                 <div id="view-port-config" class="hidden">
                     <h2 class="text-2xl font-bold text-base-content mb-6">🔌 服务端口配置</h2>
                     <section class="card bg-base-100 shadow-xl">
@@ -708,8 +697,6 @@
                                             <span class="label-text-alt">WSS 代理将流量转发到此端口 (通常是 22)。</span>
                                         </label>
                                     </div>
-
-                                    <!-- [AXIOM V2.0.5] 修复: 移除已被废弃的 internal_ipc_port -->
                                     
                                     <div class="form-control">
                                         <label class="label" for="config-internal-api-port">
@@ -743,7 +730,6 @@
             <!-- ... [保留的侧边栏内容] ... -->
             <label for="my-drawer-2" aria-label="close sidebar" class="drawer-overlay"></label> 
             <ul id="sidebar-menu" class="menu p-4 w-64 min-h-full bg-base-100 text-base-content shadow-lg">
-                <!-- [AXIOM V2.2.1] 布局: 优化侧边栏分组 -->
                 <li class="mt-4">
                     <a onclick="switchView('dashboard')" class="nav-link text-base active" data-view="dashboard" id="nav-dashboard">
                         <i data-lucide="layout-dashboard" class="w-4 h-4"></i> 仪表盘
@@ -802,7 +788,6 @@
     <dialog id="add-user-modal" class="modal">
         <div class="modal-box max-w-4xl">
             <h3 class="text-xl font-bold mb-4 border-b pb-2">新增 SSH 隧道用户</h3>
-            <!-- [AXIOM V2.2.1] 布局: 将表单移动到此处 -->
             <form id="add-user-form">
                 <div class="grid grid-cols-1 md:grid-cols-6 gap-4 items-end">
                     <div class="form-control md:col-span-2">
@@ -831,7 +816,6 @@
                         <input type="number" id="new-max-connections" value="2" min="0" required class="input input-bordered w-full" aria-label="并发连接数限制">
                     </div>
                     
-                    <!-- [AXIOM V2.2.0] 修复: 令牌生成器 UI -->
                     <div class="form-control md:col-span-2">
                         <label class="label" for="new-connect-token"><span class="label-text">Base64 连接令牌</span></label>
                         <div class="token-input-group">
@@ -899,7 +883,6 @@
                         <input type="number" id="modal-max-connections" value="2" min="0" required class="input input-bordered w-full" aria-label="并发连接数限制">
                     </div>
                     
-                    <!-- [AXIOM V1.4] 新增 Shell 访问开关 -->
                     <div class="form-control">
                         <label class="label cursor-pointer">
                             <span class="label-text">需要 Proxy-Authorization 认证</span>
@@ -924,7 +907,6 @@
                     <div class="border-t pt-4">
                         <h4 class="font-bold mb-2">连接信息与密码</h4>
                         
-                        <!-- [AXIOM V1.0] 令牌生成逻辑修改 -->
                         <div class="form-control mb-4">
                             <label class="label" for="modal-connect-token"><span class="label-text">Base64 连接令牌</span></label>
                             <div class="token-input-group">
@@ -1005,14 +987,6 @@
         </form>
     </dialog>
     
-    <!-- 
-      =====================================================================
-      [AXIOM V2.0] 脚本分离
-      - 移除所有内联的 <script>...</script> 
-      - 移除 FLASK_CONFIG 块
-      - 添加对 app.js 的引用
-      =====================================================================
-    -->
     <script src="app.js" defer></script>
 
 </body>

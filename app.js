@@ -1,31 +1,41 @@
 /**
- * WSS Panel Frontend (Axiom Refactor V3.0 - Realtime Push)
+ * WSS Panel Frontend (Axiom Refactor V3.1.2 - Realtime UI/UX + Bugfix)
  *
- * [AXIOM V3.0 CHANGELOG]
+ * [AXIOM V3.1.2 BUGFIX]
+ * - 修复: `lucide.icons[iconName].toSvg` 导致的
+ * "Cannot read properties of undefined (reading 'toSvg')" 崩溃。
+ * - `setWsStatusIcon` 被重写，现在使用 `lucide.createIcons()` 动态替换 <i> 标签，
+ * 这是 CDN 版本唯一支持的方法。
+ * - `initializeApp` 添加了 `typeof lucide` 检查，
+ * 确保在 CDN 库加载失败时安全退出。
+ * - 修复: `fillPortNumbers` 引用了 V3.1 UI 中已删除的 ID。
+ * 已从 `initializeApp` 中移除对此函数的调用。
+ *
+ * [AXIOM V3.1 CHANGELOG]
  * - [架构] 彻底移除“轮询” (Pull):
  * - 移除了 `startAutoRefresh`, `stopAutoRefresh`, `refreshLiveSpeeds`。
- * - 移除了所有 `setInterval` 和 `MAIN_REFRESH_INTERVAL` /
- * `LIVE_SPEED_INTERVAL` 常量。
+ * - 移除了所有 `setInterval`。
  * - [架构] 切换到“推送” (Push):
- * - `initializeApp` 现在调用 `connectWebSocket()`。
- * - `connectWebSocket()` 负责连接到后端的 `/ws/ui` 路径并处理自动重连。
+ * - `initializeApp` 现在调用 `connectWebSocket()` (连接到 /ws/ui)。
+ * - `ws.onmessage` 成为新的数据处理中枢。
  * - [需求 #5] WS 状态灯:
  * - 新增 `setWsStatusIcon(color, tip)` 函数，
  * 用于控制 `index.html` 中的 `ws-status-icon` (红/绿/蓝)。
- * - [需求 #1, #3, #4] 动态/静默更新:
- * - `ws.onmessage` 成为新的数据处理中枢。
- * - `case 'status_connected'`: 触发 `fetchAllStaticData` (加载一次性数据)。
- * - `case 'live_update'`: (1秒推送) 调用 `handleSilentUpdate`
- * 和 `handleDashboardSilentUpdate`。
- * - `case 'system_update'`: (60秒慢推送) 更新系统状态 (CPU/内存/服务)。
- * - `case 'users_changed'`: (手动操作) 触发 `fetchAllUsersAndRender` (全量重绘)。
- * - [需求 #4] 优雅渲染:
+ * - [建议 #4] 骨架屏:
+ * - `fetchAllStaticData` 现在负责隐藏骨架屏
+ * (`dashboard-skeleton-loader`) 并显示真实卡片。
+ * - [建议 #2] 实时图表:
+ * - 新增 `realtimeChartInstance`。
+ * - 新增 `initRealtimeTrafficChart()` 和 `updateRealtimeTrafficChart()`
+ * (由 `live_update` 消息驱动)。
+ * - [建议 #3] 卡片合并:
+ * - `renderSystemStatus` 被重构，以填充合并后的
+ * `system-status-grid` (包含状态、端口、按钮)。
+ * - [需求 #1, #4] 优雅/静默更新:
  * - `renderUserList` 和 `renderUserQuickStats`
  * 现在为动态元素添加唯一 ID。
  * - `handleSilentUpdate` 和 `handleDashboardSilentUpdate`
- * **只修改 `textContent`**，实现零闪烁的静默更新。
- * - [API] `/users/live-stats` 和 `/system/active_ips`
- * 的前端调用已被移除 (数据来自 WS)。
+ * **只修改 `textContent`**，实现零闪烁的1秒刷新。
  */
 
 // --- 全局配置 (将由 initializeApp 异步填充) ---
@@ -44,15 +54,11 @@ let FLASK_CONFIG = {
 let selectedUsers = []; 
 let trafficChartInstance = null; 
 let userStatsChartInstance = null;
-let allUsersCache = []; // 缓存用户列表以供实时速度更新
+let realtimeChartInstance = null; // [AXIOM V3.1] 实时图表
+let allUsersCache = []; 
 let currentSortKey = 'username';
 let currentSortDir = 'asc';
 
-// [AXIOM V3.0] 移除: 轮询定时器 ID
-// let mainRefreshIntervalId = null; 
-// let liveSpeedIntervalId = null; 
-// const MAIN_REFRESH_INTERVAL = 2000; 
-// const LIVE_SPEED_INTERVAL = 1000; 
 let panelSocket = null; // [AXIOM V3.0] WebSocket 实例
 let wsReconnectTimer = null; // [AXIOM V3.0] WS 重连定时器
 
@@ -64,7 +70,6 @@ const TOKEN_PLACEHOLDER = "[*********]";
 // --- 主题切换逻辑 ---
 const themeToggle = document.getElementById('theme-toggle');
 const htmlTag = document.documentElement;
-// ... [保留的主题切换逻辑] ...
 const savedTheme = localStorage.getItem('theme') || 'light';
 htmlTag.setAttribute('data-theme', savedTheme);
 if (themeToggle) {
@@ -75,16 +80,24 @@ if (themeToggle) {
         const newTheme = e.target.checked ? 'dark' : 'light';
         htmlTag.setAttribute('data-theme', newTheme);
         localStorage.setItem('theme', newTheme);
-        // [AXIOM V3.0] 修复: 主题切换时重绘图表
+        
+        // [AXIOM V3.1] 修复: 主题切换时重绘所有图表
         if (userStatsChartInstance) {
             userStatsChartInstance.destroy();
             userStatsChartInstance = null;
         }
+        if (realtimeChartInstance) {
+            realtimeChartInstance.destroy();
+            realtimeChartInstance = null;
+        }
         lastUserStats = {}; 
+        
         // 手动请求一次系统状态以重绘图表
         fetchData('/system/status').then(data => {
             if (data) {
                 renderUserQuickStats(data.user_stats);
+                // 重新初始化实时图表 (它将在下次 `live_update` 时填充)
+                initRealtimeTrafficChart();
             }
         });
     });
@@ -93,7 +106,6 @@ if (themeToggle) {
 // --- 辅助工具函数 ---
 
 function showStatus(message, isSuccess) {
-    // ... [保留的 showStatus 逻辑] ...
     const statusDiv = document.getElementById('status-message');
     statusDiv.innerHTML = ''; 
     const iconName = isSuccess ? 'check-circle' : 'alert-triangle';
@@ -115,7 +127,6 @@ function showStatus(message, isSuccess) {
 }
 
 function openModal(id) {
-    // ... [保留的 openModal 逻辑] ...
     const modal = document.getElementById(id);
     if (modal && typeof modal.showModal === 'function') {
         modal.showModal();
@@ -123,7 +134,6 @@ function openModal(id) {
 }
 
 function closeModal(id) {
-    // ... [保留的 closeModal 逻辑] ...
     if (id === 'traffic-chart-modal' && trafficChartInstance) {
         trafficChartInstance.destroy();
         trafficChartInstance = null;
@@ -139,7 +149,6 @@ function logout() {
 }
 
 function formatSpeedUnits(kbps) {
-    // ... [保留的 formatSpeedUnits 逻辑] ...
     const rate = parseFloat(kbps);
     if (isNaN(rate) || rate <= 0) return '0.0 KB/s';
     
@@ -152,13 +161,11 @@ function formatSpeedUnits(kbps) {
 }
 
 function formatConnections(count) {
-    // ... [保留的 formatConnections 逻辑] ...
     const num = parseInt(count);
     return (num === 0) ? '∞' : num;
 }
 
 function copyToClipboard(elementId, message) {
-     // ... [保留的 copyToClipboard 逻辑] ...
      const copyTextEl = document.getElementById(elementId);
      const copyText = copyTextEl.value;
      if (!copyText || copyText === TOKEN_PLACEHOLDER || copyText.startsWith('[在此输入')) {
@@ -186,19 +193,12 @@ function copyToClipboard(elementId, message) {
      }
 }
 
-function fillPortNumbers() {
-    // ... [保留的 fillPortNumbers 逻辑] ...
-    document.getElementById('wss-http-port').textContent = FLASK_CONFIG.WSS_HTTP_PORT;
-    document.getElementById('wss-tls-port').textContent = FLASK_CONFIG.WSS_TLS_PORT;
-    document.getElementById('stunnel-port').textContent = FLASK_CONFIG.STUNNEL_PORT;
-    document.getElementById('udpgw-port').textContent = FLASK_CONFIG.UDPGW_PORT;
-    document.getElementById('panel-port').textContent = FLASK_CONFIG.PANEL_PORT;
-}
+// [AXIOM V3.1.1] 移除: `fillPortNumbers()` 函数已废弃
 
 // --- 视图切换逻辑 ---
 
 function switchView(viewId) {
-    // ... [保留的 switchView 逻辑, 增加 fetchAllStaticData 的调用] ...
+    // [AXIOM V3.1] 重构: 切换视图时按需加载数据
     const views = ['dashboard', 'users', 'settings', 'security', 'live-ips', 'hosts', 'payload-gen', 'port-config'];
     views.forEach(id => {
         const element = document.getElementById('view-' + id);
@@ -224,14 +224,12 @@ function switchView(viewId) {
         clearSelections();
     }
     
-    // [AXIOM V3.0] 优化: 切换视图时，从 API 重新加载该视图的静态数据
-    // (因为 WS 只推送实时数据)
+    // 按需加载数据
     if (viewId === 'payload-gen') {
         if (allUsersCache.length > 0) {
             populatePayloadUserSelect();
         } else {
-            // 如果缓存为空 (例如直接访问 /#users)，则加载
-            fetchAllUsersAndRender();
+            fetchAllUsersAndRender(); // 确保用户列表被加载
         }
     }
     
@@ -241,11 +239,11 @@ function switchView(viewId) {
     
     if (viewId === 'settings') {
         fetchGlobalSettings();
-        fetchAuditLogs(); // [AXIOM V3.0] 新增: 分离审计日志加载
+        fetchAuditLogs(); 
     }
     
     if (viewId === 'security') {
-        fetchGlobalBans(); // [AXIOM V3.0] 新增: 分离封禁列表加载
+        fetchGlobalBans(); 
     }
     
     if (viewId === 'port-config') {
@@ -253,7 +251,7 @@ function switchView(viewId) {
     }
     
     if (viewId === 'live-ips') {
-        fetchActiveIPs(); // [AXIOM V3.0] 新增: 分离 IP 列表加载
+        fetchActiveIPs(); 
     }
     
     if (window.innerWidth < 1024) { 
@@ -266,88 +264,122 @@ function switchView(viewId) {
 
 // --- 数据渲染函数 ---
 
+/**
+ * [AXIOM V3.1] 重构: 建议 #3 (卡片合并)
+ * 此函数现在填充合并后的“核心基础设施”卡片
+ */
 function renderSystemStatus(data) {
-    // ... [保留的 renderSystemStatus 逻辑] ...
     const grid = document.getElementById('system-status-grid');
-    grid.innerHTML = ''; 
-    grid.className = "stats stats-vertical lg:stats-horizontal shadow w-full bg-base-100"; 
+    grid.innerHTML = ''; // 清空
+    grid.className = "space-y-4"; // 更改为 Y 轴堆叠
 
-    const items = [
+    const fragment = document.createDocumentFragment();
+    
+    // --- 1. 渲染系统状态 (CPU/内存/磁盘) ---
+    const systemItems = [
         { name: 'CPU 使用率 (LoadAvg)', value: data.cpu_usage.toFixed(1) + '%', color: 'text-blue-500', icon: 'cpu' },
         { name: '内存 (用/总)', value: data.memory_used_gb.toFixed(2) + '/' + data.memory_total_gb.toFixed(2) + 'GB', color: 'text-indigo-500', icon: 'brain' },
         { name: '磁盘使用率', value: data.disk_used_percent.toFixed(1) + '%', color: 'text-purple-500', icon: 'database' },
-        ...Object.keys(data.services).map(key => {
-            const status = data.services[key].status;
-            let color, dotClass;
-            if (status === 'running') {
-                color = 'text-success';
-                dotClass = 'badge-success';
-            } else if (status === 'failed') {
-                color = 'text-error';
-                dotClass = 'badge-error';
-            } else {
-                color = 'text-warning';
-                dotClass = 'badge-warning';
-            }
-            return {
-                name: data.services[key].name,
-                value: data.services[key].label,
-                color: color,
-                dotClass: dotClass,
-                icon: 'server'
-            };
-        })
     ];
-
-    const fragment = document.createDocumentFragment();
-    items.forEach(item => {
-        const dot = item.dotClass ? `<span class="badge ${item.dotClass} badge-xs mr-2 p-1"></span>` : '';
+    
+    const statsGrid = document.createElement('div');
+    statsGrid.className = "stats stats-vertical shadow w-full bg-base-100";
+    
+    // [AXIOM V3.1] 新增 ID 用于静默更新
+    systemItems.forEach(item => {
         const card = document.createElement('div');
         card.className = 'stat';
         card.innerHTML = 
             `<div class="stat-figure ${item.color}"><i data-lucide="${item.icon}" class="w-6 h-6"></i></div>` +
-            '<div class="stat-title text-sm">' + item.name + '</div>' +
-            `<div class="stat-value text-xl ${item.color} flex items-center">` +
-                dot + ' ' + item.value +
+            `<div class="stat-title text-sm">${item.name}</div>` +
+            `<div class="stat-value text-xl ${item.color} flex items-center" id="stat-${item.icon}">` +
+                 item.value +
             '</div>';
-        fragment.appendChild(card);
+        statsGrid.appendChild(card);
     });
-    grid.innerHTML = '';
-    grid.appendChild(fragment);
-    lucide.createIcons({ context: grid });
-    renderPortStatusList(data.ports);
-}
+    fragment.appendChild(statsGrid);
+    
+    // --- 2. 渲染服务状态 (带按钮) ---
+    const servicesTitle = document.createElement('h3');
+    servicesTitle.className = "text-lg font-semibold pt-4 border-t border-base-300";
+    servicesTitle.textContent = "服务控制";
+    fragment.appendChild(servicesTitle);
+    
+    const servicesContainer = document.createElement('div');
+    servicesContainer.className = "space-y-2";
+    
+    Object.keys(data.services).forEach(key => {
+        const item = data.services[key];
+        const status = item.status;
+        let color, dotClass;
+        if (status === 'running') {
+            color = 'text-success';
+            dotClass = 'badge-success';
+        } else if (status === 'failed') {
+            color = 'text-error';
+            dotClass = 'badge-error';
+        } else {
+            color = 'text-warning';
+            dotClass = 'badge-warning';
+        }
+        
+        const div = document.createElement('div');
+        // [AXIOM V3.1] 新增 ID 用于静默更新
+        div.id = `service-status-${key}`;
+        div.className = 'flex justify-between items-center text-base-content p-2 bg-base-200 rounded-lg border border-base-300';
+        div.innerHTML = 
+            `<div class="flex items-center">
+                <span class="badge ${dotClass} badge-xs mr-2 p-1"></span>
+                <span class="font-medium text-sm">${item.name}</span>
+            </div>
+            <button onclick="confirmAction('${key}', 'restart', null, 'serviceControl', '重启 ${item.name}')" 
+                    class="btn ${status === 'running' ? 'btn-primary' : 'btn-error'} btn-xs">
+                <i data-lucide="refresh-cw" class="w-3 h-3"></i> 重启
+            </button>`;
+        servicesContainer.appendChild(div);
+    });
+    fragment.appendChild(servicesContainer);
 
-function renderPortStatusList(ports) {
-    // ... [保留的 renderPortStatusList 逻辑] ...
-    const container = document.getElementById('port-status-data');
-    container.innerHTML = '';
-    const fragment = document.createDocumentFragment();
-    ports.forEach(p => {
+    // --- 3. 渲染端口状态 ---
+    const portsTitle = document.createElement('h3');
+    portsTitle.className = "text-lg font-semibold pt-4 border-t border-base-300";
+    portsTitle.textContent = "端口状态";
+    fragment.appendChild(portsTitle);
+    
+    const portsContainer = document.createElement('div');
+    portsContainer.className = "space-y-2";
+    
+    data.ports.forEach(p => {
         const isListening = p.status === 'LISTEN';
         const badgeClass = isListening ? 'badge-success' : 'badge-error';
         const div = document.createElement('div');
-        div.className = 'flex justify-between items-center text-gray-700 p-2 bg-base-100 rounded-lg shadow-sm border border-base-300';
+        // [AXIOM V3.1] 新增 ID 用于静默更新
+        div.id = `port-status-${p.name}`;
+        div.className = 'flex justify-between items-center text-gray-700 p-2 bg-base-200 rounded-lg shadow-sm border border-base-300';
         div.innerHTML = 
-            '<span class="font-medium">' + p.name + ' (' + p.port + '/' + p.protocol + '):</span>' +
+            '<span class="font-medium text-sm">' + p.name + ' (' + p.port + '/' + p.protocol + '):</span>' +
             `<span class="badge ${badgeClass} badge-sm font-bold">` + p.status +
             '</span>';
-        fragment.appendChild(div);
+        portsContainer.appendChild(div);
     });
-     container.appendChild(fragment);
+    fragment.appendChild(portsContainer);
+    
+    // --- 最终渲染 ---
+    grid.appendChild(fragment);
+    lucide.createIcons({ context: grid });
 }
 
 /**
- * [AXIOM V3.0] 重构: renderUserQuickStats
+ * [AXIOM V3.1] 重构: renderUserQuickStats
  * - 为动态元素添加 ID
  */
 function renderUserQuickStats(stats) {
-    // ... [保留的 V1.2 逻辑, 但添加了 ID] ...
-    if (stats.total === lastUserStats.total && 
-        stats.total_traffic_gb.toFixed(2) === lastUserStats.total_traffic_gb.toFixed(2) &&
-        stats.active === lastUserStats.active) {
-        return; 
+    if (!stats) {
+        console.warn("[Axiom] renderUserQuickStats 收到空 stats");
+        return;
     }
+    
+    // [AXIOM V3.1] 移除缓存检查, 因为此函数只在“慢速”更新时调用
     lastUserStats = stats;
     
     const container = document.getElementById('user-quick-stats-text');
@@ -426,7 +458,7 @@ function renderUserQuickStats(stats) {
 }
 
 /**
- * [AXIOM V3.0] 重构: buildUserCard (移动端)
+ * [AXIOM V3.1] 重构: buildUserCard (移动端)
  * - 为动态元素添加 ID
  */
 function buildUserCard(user, statusColor, statusText, toggleAction, toggleText, toggleColor, usageText, usageProgressHtml) {
@@ -436,11 +468,10 @@ function buildUserCard(user, statusColor, statusText, toggleAction, toggleText, 
     if (user.status === 'expired' || user.status === 'exceeded') borderColor = 'border-error';
     const isChecked = selectedUsers.includes(user.username) ? 'checked' : '';
     
-    // [AXIOM V3.0] 移除: 速度数据现在由静默更新填充
-    // const speedUp = formatSpeedUnits(user.realtime_speed_up);
-    // const speedDown = formatSpeedUnits(user.realtime_speed_down);
+    // [AXIOM V3.1] 骨架渲染: 速度和连接数默认为 '...'，等待静默更新
     const speedUp = '...';
     const speedDown = '...';
+    const activeConnections = user.active_connections !== undefined ? user.active_connections : 0;
     
     const shellStatus = user.allow_shell === 1;
     const shellColor = shellStatus ? 'text-secondary' : 'text-gray-500';
@@ -454,7 +485,7 @@ function buildUserCard(user, statusColor, statusText, toggleAction, toggleText, 
                     <input type="checkbox" data-username="${user.username}" ${isChecked} class="user-checkbox checkbox checkbox-primary mr-3">
                     <span class="font-bold text-lg text-base-content font-mono">${user.username}</span>
                 </div>
-                <!-- [AXIOM V3.0] 新增 ID -->
+                <!-- [AXIOM V3.1] 新增 ID -->
                 <span id="status-card-${user.username}" class="badge ${statusColor} text-xs font-semibold">
                     ${statusText}
                 </span>
@@ -462,15 +493,15 @@ function buildUserCard(user, statusColor, statusText, toggleAction, toggleText, 
             <div class="text-sm text-gray-600 space-y-1.5 mb-4">
                 <p><strong>到期日:</strong> <span class="font-medium text-base-content">${user.expiration_date || '永不'}</span></p>
                 
-                <!-- [AXIOM V3.0] 新增 ID -->
+                <!-- [AXIOM V3.1] 新增 ID -->
                 <div id="usage-card-${user.username}" class="pt-1">
                     <strong>用量 (GB):</strong> <span class="font-medium text-base-content">${usageText}</span>
                     ${usageProgressHtml}
                 </div>
                 
                 <p><strong>连接/并发:</strong> 
-                    <!-- [AXIOM V3.0] 新增 ID -->
-                    <span id="conn-mobile-${user.username}" class="font-medium text-primary">${user.active_connections}</span> / 
+                    <!-- [AXIOM V3.1] 新增 ID -->
+                    <span id="conn-mobile-${user.username}" class="font-medium text-primary">${activeConnections}</span> / 
                     <span class="font-medium text-base-content">${formatConnections(user.max_connections)}</span>
                 </p>
                 
@@ -502,7 +533,7 @@ function buildUserCard(user, statusColor, statusText, toggleAction, toggleText, 
 }
 
 /**
- * [AXIOM V3.0] 重构: renderUserList (PC/移动端)
+ * [AXIOM V3.1] 重构: renderUserList (PC/移动端)
  * - 这是一个“骨架”渲染器
  * - 为所有动态元素添加 ID
  */
@@ -513,7 +544,6 @@ function renderUserList(users) {
     let mobileHtml = [];
     
     document.querySelectorAll('th.sortable .sort-arrow').forEach(arrow => {
-        // ... [保留的排序箭头逻辑] ...
         const th = arrow.parentElement;
         if (th.dataset.sortkey === currentSortKey) {
             arrow.innerHTML = currentSortDir === 'asc' ? '▲' : '▼';
@@ -547,8 +577,7 @@ function renderUserList(users) {
         const maxConnections = user.max_connections !== undefined ? user.max_connections : 0; 
         const fuseThreshold = user.fuse_threshold_kbps !== undefined ? user.fuse_threshold_kbps : 0; 
         
-        // [AXIOM V3.0] 移除: 速度/连接数在渲染骨架时设为 0 或 ...
-        // 它们将由 `handleSilentUpdate` 填充
+        // [AXIOM V3.1] 骨架渲染: 速度和连接数默认为 '...'
         const speedUp = '...';
         const speedDown = '...';
         const activeConnections = user.active_connections !== undefined ? user.active_connections : 0;
@@ -570,7 +599,7 @@ function renderUserList(users) {
                 </td>
                 <td class="px-6 py-4 whitespace-nowrap text-sm font-mono text-base-content" role="cell">${user.username}</td>
                 
-                <!-- [AXIOM V3.0] 新增 ID -->
+                <!-- [AXIOM V3.1] 新增 ID -->
                 <td id="status-cell-${user.username}" class="px-6 py-4 whitespace-nowrap text-sm" role="cell">
                     <span class="badge ${statusColor} text-xs font-semibold">
                         ${statusText}
@@ -579,12 +608,12 @@ function renderUserList(users) {
                 
                 <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500" role="cell">${user.expiration_date || '永不'}</td>
                 
-                <!-- [AXIOM V3.0] 新增 ID -->
+                <!-- [AXIOM V3.1] 新增 ID -->
                 <td id="conn-cell-${user.username}" class="px-6 py-4 whitespace-nowrap text-sm font-medium text-primary" role="cell">${activeConnections}</td>
                 
                 <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-base-content" role="cell">${formatConnections(maxConnections)}</td>
                 
-                <!-- [AXIOM V3.0] 新增 ID -->
+                <!-- [AXIOM V3.1] 新增 ID -->
                 <td id="usage-cell-${user.username}" class="px-6 py-4 whitespace-nowrap text-sm font-medium text-base-content" role="cell">
                     <div>${usageText} GB</div>
                     ${progressHtml}
@@ -660,10 +689,6 @@ function renderFilteredUserList() {
     });
     
     renderUserList(usersToRender);
-    // [AXIOM V3.0] 关键: 渲染骨架后，立即请求一次实时数据
-    // (因为旧数据可能已过时，而下一次 WS 推送可能在 1 秒后)
-    // (更好的方法是让 `handleSilentUpdate` 更新 `allUsersCache`，但
-    // 为了简单起见，我们暂时忽略)
 }
 
 function renderActiveGlobalIPs(ipData) {
@@ -777,7 +802,6 @@ async function fetchData(url, options = {}) {
         const response = await fetch(API_BASE + url, options);
         if (response.status === 401) {
             showStatus("会话过期或权限不足，请重新登录。", false);
-            // [AXIOM V3.0] 停止 WS 重连
             if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
             if (panelSocket) panelSocket.close();
             window.location.assign('/login.html'); 
@@ -806,13 +830,11 @@ async function fetchData(url, options = {}) {
         const data = await response.json();
         
         if (!response.ok || (typeof data.success === 'boolean' && !data.success)) {
-            // [AXIOM V3.0] 移除: live-stats 检查
             showStatus(data.message || 'API Error: ' + url, false);
             return null;
         }
         return data;
     } catch (error) {
-         // [AXIOM V3.0] 移除: live-stats 检查
          showStatus('网络请求失败: ' + error.message, false);
         return null;
     }
@@ -857,6 +879,7 @@ async function saveHosts() {
     });
     if (result) {
         showStatus(result.message, true);
+        // [AXIOM V3.1] 移除: 后端会推送 'hosts_changed'
     }
 }
 
@@ -939,54 +962,64 @@ async function saveGlobalConfig() {
  * @param {string} tip 鼠标悬停提示
  */
 function setWsStatusIcon(color, tip) {
-    const icon = document.getElementById('ws-status-icon');
-    const tooltip = document.getElementById('ws-status-tooltip');
-    if (!icon || !tooltip) return;
-
-    tooltip.dataset.tip = tip;
+    // [AXIOM V3.1.2 BUGFIX]
+    // This function is rewritten to correctly handle icon replacement
+    // using the `lucide.createIcons()` CDN method,
+    // fixing the "toSvg is not defined" error.
     
-    // 移除所有颜色类
-    icon.classList.remove('status-light-red', 'status-light-green', 'status-light-blue', 'status-light-gray');
+    const button = document.getElementById('ws-status-button');
+    const tooltip = document.getElementById('ws-status-tooltip');
+    if (!button || !tooltip) return;
+
+    tooltip.setAttribute('data-tip', tip);
     
     let iconName = 'wifi';
+    let iconClass = 'w-5 h-5 transition-colors duration-300 ';
+
     switch (color) {
         case 'red':
-            icon.classList.add('status-light-red');
+            iconClass += 'status-light-red';
             iconName = 'wifi-off';
             break;
         case 'green':
-            icon.classList.add('status-light-green');
+            iconClass += 'status-light-green';
             iconName = 'wifi';
             break;
         case 'blue':
-            icon.classList.add('status-light-blue');
-            iconName = 'loader-2'; // "连接中" 图标
+            iconClass += 'status-light-blue animate-spin'; // Add spin class
+            iconName = 'loader-2'; 
             break;
         case 'gray':
         default:
-            icon.classList.add('status-light-gray');
+            iconClass += 'status-light-gray';
             iconName = 'wifi-off';
             break;
     }
     
-    // 更新图标 (如果图标变化)
-    if (icon.dataset.lucide !== iconName) {
-        icon.dataset.lucide = iconName;
-        // 使用 Lucide API 替换图标
+    // 1. 清空按钮的旧图标
+    button.innerHTML = '';
+    
+    // 2. 创建一个新的 <i> 元素
+    const newIcon = document.createElement('i');
+    newIcon.id = 'ws-status-icon'; // 重新分配 ID
+    newIcon.setAttribute('data-lucide', iconName);
+    newIcon.className = iconClass;
+    
+    // 3. 将新的 <i> 元素附加到按钮
+    button.appendChild(newIcon);
+    
+    // 4. 在新创建的 <i> 元素上调用 lucide.createIcons()
+    // 这将找到 <i> 标签并将其替换为 <svg>
+    // （SVG 会自动继承 ID 和 Class）
+    try {
         lucide.createIcons({
-            nodes: [icon],
-            attrs: {
-                'data-lucide': iconName,
-                'class': icon.className // 保持现有类
-            }
+            nodes: [newIcon]
         });
-        
-        // 如果是 loader-2，添加旋转动画
-        if (iconName === 'loader-2') {
-            icon.classList.add('animate-spin');
-        } else {
-            icon.classList.remove('animate-spin');
-        }
+    } catch (e) {
+        console.error("Lucide icon creation failed:", e);
+        // 如果 lucide 库因某种原因再次失败，
+        // 至少显示一个文本占位符
+        newIcon.textContent = iconName; 
     }
 }
 
@@ -1003,7 +1036,6 @@ function connectWebSocket() {
         panelSocket = null;
     }
 
-    // 1. 设置 WS 协议和 URL
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${wsProtocol}//${window.location.host}/ws/ui`;
     
@@ -1012,54 +1044,48 @@ function connectWebSocket() {
 
     panelSocket = new WebSocket(wsUrl);
 
-    // 2. 连接成功
     panelSocket.onopen = (event) => {
         console.log('[AXIOM V3.0] WebSocket 已连接。等待服务器验证...');
         // (等待来自服务器的 'status_connected' 消息)
     };
 
-    // 3. 收到消息 (核心处理器)
     panelSocket.onmessage = (event) => {
         try {
             const message = JSON.parse(event.data);
             
             switch (message.type) {
-                // 需求 #5: (蓝 -> 绿) 连接并验证成功
                 case 'status_connected':
                     setWsStatusIcon('green', '实时推送已连接 (1秒刷新)');
                     console.log('[AXIOM V3.0] WebSocket 身份验证成功。正在加载初始数据...');
-                    // 触发一次性的初始数据加载
                     fetchAllStaticData(); 
                     break;
                 
-                // 需求 #1, #4: (1秒推送) 实时数据更新
                 case 'live_update':
                     if (message.payload) {
-                        // 优雅/静默更新
                         if (message.payload.users) {
                             handleSilentUpdate(message.payload.users);
                         }
                         if (message.payload.system) {
                             handleDashboardSilentUpdate(message.payload.system);
+                            // [AXIOM V3.1] 建议 #2: 更新实时图表
+                            updateRealtimeTrafficChart(message.payload);
                         }
                     }
                     break;
                 
-                // (60秒慢推送) 非紧急系统状态
                 case 'system_update':
                     if (message.payload && currentView === 'dashboard') {
+                        // [AXIOM V3.1] 建议 #3: 调用重构后的渲染器
                         renderSystemStatus(message.payload);
                         renderUserQuickStats(message.payload.user_stats);
                     }
                     break;
                 
-                // (手动操作) 静态数据变更
                 case 'users_changed':
                     console.log('[AXIOM V3.0] 收到 users_changed 推送，正在全量刷新用户列表...');
                     fetchAllUsersAndRender();
                     break;
                 
-                // (手动操作) Host 变更
                 case 'hosts_changed':
                     if (currentView === 'hosts') {
                         console.log('[AXIOM V3.0] 收到 hosts_changed 推送，正在刷新 Hosts...');
@@ -1067,7 +1093,6 @@ function connectWebSocket() {
                     }
                     break;
                 
-                // 验证失败
                 case 'auth_failed':
                     console.error('[AXIOM V3.0] WebSocket 身份验证失败。');
                     setWsStatusIcon('red', '实时推送身份验证失败');
@@ -1080,7 +1105,6 @@ function connectWebSocket() {
         }
     };
 
-    // 4. 连接关闭
     panelSocket.onclose = (event) => {
         console.warn(`[AXIOM V3.0] WebSocket 已断开。代码: ${event.code}. 3秒后重试...`);
         setWsStatusIcon('red', '实时推送已断开，正在重连...');
@@ -1089,17 +1113,125 @@ function connectWebSocket() {
         }
     };
 
-    // 5. 连接错误
     panelSocket.onerror = (error) => {
         console.error('[AXIOM V3.0] WebSocket 发生错误: ', error);
         setWsStatusIcon('red', '实时推送连接错误');
-        // onclose 会自动被触发, 无需在此处重连
     };
 }
 
 
 /**
- * [AXIOM V3.0] 新增: 优雅的静默更新处理器 (1秒)
+ * [AXIOM V3.1] 建议 #2: 初始化实时流量图
+ */
+function initRealtimeTrafficChart() {
+    if (realtimeChartInstance) {
+        realtimeChartInstance.destroy();
+    }
+    const ctx = document.getElementById('realtime-traffic-chart').getContext('2d');
+    
+    // 生成 30 个空标签
+    const initialLabels = Array(30).fill('');
+    const initialDataUp = Array(30).fill(0);
+    const initialDataDown = Array(30).fill(0);
+
+    realtimeChartInstance = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: initialLabels,
+            datasets: [
+                {
+                    label: '上传 (KB/s)',
+                    data: initialDataUp,
+                    borderColor: '#34d399', // green-400
+                    backgroundColor: 'rgba(52, 211, 153, 0.1)',
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    tension: 0.3,
+                    fill: true
+                },
+                {
+                    label: '下载 (KB/s)',
+                    data: initialDataDown,
+                    borderColor: '#3b82f6', // blue-500
+                    backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    tension: 0.3,
+                    fill: true
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false, // 关键: 禁用动画以实现平滑更新
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    ticks: {
+                        callback: function(value, index, values) {
+                            return value + ' KB/s';
+                        }
+                    }
+                },
+                x: {
+                    ticks: { display: false } // 隐藏 X 轴标签
+                }
+            },
+            plugins: {
+                legend: { position: 'bottom', labels: { padding: 10 } },
+                tooltip: {
+                    intersect: false,
+                    mode: 'index',
+                }
+            },
+            interaction: {
+                intersect: false,
+                mode: 'index',
+            }
+        }
+    });
+}
+
+/**
+ * [AXIOM V3.1] 建议 #2: 更新实时流量图 (1秒)
+ */
+function updateRealtimeTrafficChart(liveUpdatePayload) {
+    if (!realtimeChartInstance || !liveUpdatePayload || !liveUpdatePayload.users) {
+        return;
+    }
+    
+    // [AXIOM V3.1] 聚合所有用户的总速度
+    let totalSpeedUp = 0;
+    let totalSpeedDown = 0;
+    for (const username in liveUpdatePayload.users) {
+        const userSpeed = liveUpdatePayload.users[username].speed_kbps;
+        totalSpeedUp += (userSpeed.upload || 0);
+        totalSpeedDown += (userSpeed.download || 0);
+    }
+    
+    const labels = realtimeChartInstance.data.labels;
+    const dataUp = realtimeChartInstance.data.datasets[0].data;
+    const dataDown = realtimeChartInstance.data.datasets[1].data;
+
+    // 1. 移除最旧的数据
+    labels.shift();
+    dataUp.shift();
+    dataDown.shift();
+
+    // 2. 添加最新的数据
+    const now = new Date();
+    labels.push(now.toLocaleTimeString()); 
+    dataUp.push(totalSpeedUp.toFixed(1));
+    dataDown.push(totalSpeedDown.toFixed(1));
+
+    // 3. 更新图表
+    realtimeChartInstance.update();
+}
+
+
+/**
+ * [AXIOM V3.0] 优雅的静默更新处理器 (1秒)
  * @param {object} userStats - 例如: { "user_A": { "speed_kbps": {...}, "connections": 2 }, ... }
  */
 function handleSilentUpdate(userStats) {
@@ -1118,7 +1250,6 @@ function handleSilentUpdate(userStats) {
         const connCell = document.getElementById(`conn-cell-${username}`); 
 
         if (speedCell) {
-            // 使用 .innerHTML 以保留内部的 <span> 样式
             speedCell.innerHTML = 
                 `<span class="speed-up">↑ ${speedUpText}</span> / ` +
                 `<span class="speed-down">↓ ${speedDownText}</span>`;
@@ -1139,11 +1270,11 @@ function handleSilentUpdate(userStats) {
 }
 
 /**
- * [AXIOM V3.0] 新增: 静默更新仪表盘 (1秒)
+ * [AXIOM V3.0] 静默更新仪表盘 (1秒)
  * @param {object} systemStats - 例如: { "active_connections_total": 3 }
  */
 function handleDashboardSilentUpdate(systemStats) {
-    if (currentView !== 'dashboard') return; // 仅在仪表盘视图活动时更新
+    if (currentView !== 'dashboard') return; 
 
     // 只更新“活跃连接数”
     const activeConnsWidget = document.getElementById('stat-active-conns');
@@ -1154,20 +1285,23 @@ function handleDashboardSilentUpdate(systemStats) {
 
 
 /**
- * [AXIOM V3.0] 重构: `refreshAllData` -> `fetchAllStaticData`
- * 仅在 WS 连接成功时调用一次
+ * [AXIOM V3.1] 重构: `fetchAllStaticData`
+ * 仅在 WS 连接成功时调用一次, 并处理骨架屏
  */
 async function fetchAllStaticData() {
     console.log("[AXIOM V3.0] 正在加载一次性静态数据...");
     try {
-        // 1. 加载仪表盘数据 (CPU/内存/服务/端口/用户统计)
+        // 1. 加载仪表盘数据
         const statusData = await fetchData('/system/status');
         if (statusData) {
+            // [AXIOM V3.1] 建议 #3: 调用重构后的渲染器
             renderSystemStatus(statusData);
             renderUserQuickStats(statusData.user_stats); 
+            // [AXIOM V3.1] 建议 #2: 初始化实时图表
+            initRealtimeTrafficChart();
         }
 
-        // 2. 加载用户列表 (用于用户页面和载荷生成器)
+        // 2. 加载用户列表
         await fetchAllUsersAndRender();
         
         // 3. (可选) 预加载其他视图的数据
@@ -1175,15 +1309,17 @@ async function fetchAllStaticData() {
         if (currentView === 'settings') { fetchAuditLogs(); }
         if (currentView === 'security') { fetchGlobalBans(); }
         
+        // 4. [AXIOM V3.1] 建议 #4: 隐藏骨架屏, 显示真实卡片
+        document.getElementById('dashboard-skeleton-loader').style.display = 'none';
+        document.getElementById('system-status-card').style.display = 'block';
+        document.getElementById('user-stats-card').style.display = 'block';
+        document.getElementById('realtime-traffic-card').style.display = 'block';
+        
     } catch (error) {
         console.error("Error during fetchAllStaticData:", error);
     }
 }
 
-/**
- * [AXIOM V3.0] 新增: 分离的用户列表加载器
- * (由 WS 的 `users_changed` 或 `status_connected` 触发)
- */
 async function fetchAllUsersAndRender() {
     const usersData = await fetchData('/users/list');
     if (usersData) {
@@ -1197,7 +1333,6 @@ async function fetchAllUsersAndRender() {
     }
 }
 
-// [AXIOM V3.0] 新增: 分离的加载器
 async function fetchActiveIPs() {
      const ipData = await fetchData('/system/active_ips');
      if (ipData) {
@@ -1217,13 +1352,9 @@ async function fetchGlobalBans() {
     }
 }
 
-// [AXIOM V3.0] 移除: `refreshLiveSpeeds` (已废弃)
-
-
 // --- 用户操作实现 ---
 
 function generateBase64Token(username, password) {
-    // ... [保留的 generateBase64Token 逻辑] ...
     if (!username || !password) return null; 
     try {
         const token = btoa(`${username}:${password}`); 
@@ -1235,7 +1366,6 @@ function generateBase64Token(username, password) {
 }
 
 document.getElementById('add-user-form').addEventListener('submit', async (e) => {
-    // ... [保留的 add-user-form 逻辑] ...
     e.preventDefault();
     const username = document.getElementById('new-username').value;
     const password = document.getElementById('new-password').value;
@@ -1276,7 +1406,7 @@ document.getElementById('add-user-form').addEventListener('submit', async (e) =>
             tokenOutput.value = "[在此输入用户名和密码]";
         }
         // [AXIOM V3.0] 移除: refreshAllData()
-        // (后端将在成功后推送 'users_changed' 消息)
+        // (后端将推送 'users_changed' 消息)
     }
 });
 
@@ -1341,7 +1471,7 @@ async function saveUserSettings() {
     if (result) {
         showStatus(result.message, true);
         // [AXIOM V3.0] 移除: refreshAllData()
-        // (后端将在成功后推送 'users_changed' 消息)
+        // (后端将推送 'users_changed' 消息)
     }
 }
 
@@ -1555,14 +1685,12 @@ function setupCreateUserTokenListeners() {
 
 // --- 启动脚本 ---
 
-// [AXIOM V3.0] 移除: `startAutoRefresh`, `stopAutoRefresh`
-
 /**
- * [AXIOM V3.0] 重构: 异步初始化
+ * [AXIOM V3.1.2] 重构: 异步初始化
  */
 async function initializeApp() {
     try {
-        // [AXIOM V3.0] 1. 异步获取配置 (保持不变)
+        // 1. 异步获取配置
         const data = await fetchData('/settings/config');
         if (data && data.config) {
             FLASK_CONFIG = {
@@ -1578,21 +1706,32 @@ async function initializeApp() {
              return;
         }
         
-        // [AXIOM V3.0] 2. 填充静态 UI
-        fillPortNumbers();
-        lucide.createIcons();
+        // 2. 填充静态 UI (端口号)
+        // [AXIOM V3.1.1 BUGFIX] 移除: 此函数引用的 ID 已在 V3.1 UI
+        // 重构中被移除 (已合并到 renderSystemStatus)。
+        // fillPortNumbers();
+        
+        // (lucide.createIcons() 将在 connectWebSocket -> setWsStatusIcon 中首次调用)
+        // [AXIOM V3.1.2 BUGFIX] 
+        // 添加一个“安全检查”，确保 lucide 库已加载
+        // 在我们第一次调用 setWsStatusIcon 之前
+        if (typeof lucide === 'undefined' || typeof lucide.createIcons !== 'function') {
+            showStatus('图标库(Lucide)加载失败，请刷新。', false);
+            console.error("Lucide library is not loaded.");
+            return;
+        }
+        
         lastUserStats = {}; 
+        
+        // 3. 切换到仪表盘 (将显示骨架屏)
         switchView('dashboard');
         
-        // [AXIOM V3.0] 3. 启动 WebSocket (移除轮询)
-        // 初始数据加载将由 'status_connected' WS 消息触发
+        // 4. 启动 WebSocket (这将触发 'status_connected' 和 fetchAllStaticData)
         connectWebSocket();
         
-        // [AXIOM V3.0] 4. 绑定所有静态事件监听器
+        // 5. 绑定所有静态事件监听器
         setupPayloadAuthListeners(); 
         setupCreateUserTokenListeners();
-        
-        // [AXIOM V3.0] 移除: 'visibilitychange' (不再需要)
         
         document.getElementById('user-search-input').addEventListener('input', () => {
             renderFilteredUserList();
@@ -1644,9 +1783,6 @@ async function initializeApp() {
                 }
             });
         }
-        
-        // [AXIOM V3.0] 移除: 'themeToggle' 的重载逻辑
-        // (已移至 V3.0 的 'themeToggle' 监听器顶部)
         
     } catch (e) {
         console.error("Failed to initialize app:", e);
@@ -1755,7 +1891,7 @@ async function executeAction() {
             clearSelections();
         }
         // [AXIOM V3.0] 移除: refreshAllData()
-        // (后端将在成功后推送 'users_changed' 消息)
+        // (后端将推送 'users_changed' 消息)
     }
 }
 
